@@ -10,8 +10,10 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from disney_customers_feedback_ex.core.logging import setup_logging
+from disney_customers_feedback_ex.services.embedding_service import EmbeddingService
 from disney_customers_feedback_ex.services.llm_service import LLMService
 from disney_customers_feedback_ex.services.review_service import ReviewService
+from disney_customers_feedback_ex.services.vector_store import VectorStore
 
 logger = logging.getLogger(__name__)
 
@@ -21,12 +23,14 @@ load_dotenv()
 # Global services
 review_service: ReviewService | None = None
 llm_service: LLMService | None = None
+embedding_service: EmbeddingService | None = None
+vector_store: VectorStore | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
-    global review_service, llm_service
+    global review_service, llm_service, embedding_service, vector_store
     
     # Startup
     setup_logging()
@@ -34,9 +38,38 @@ async def lifespan(app: FastAPI):
     
     # Initialize services
     data_path = Path(__file__).parent / "resources" / "DisneylandReviews.csv"
-    review_service = ReviewService(data_path)
+    
+    # Initialize embedding service
+    embedding_service = EmbeddingService()
+    embedding_service.load_model()
+    
+    # Initialize vector store
+    vector_store = VectorStore()
+    try:
+        vector_store.connect()
+        
+        # Clean the database before loading new data
+        logger.info("Cleaning ChromaDB collection before loading new data...")
+        #vector_store.reset_collection()
+        vector_store.create_collection()
+        logger.info("Vector store connected and cleaned successfully")
+    except Exception as e:
+        logger.warning(f"Vector store connection failed: {str(e)}. Continuing without semantic search.")
+        vector_store = None
+        embedding_service = None
+    
+    # Initialize review service with optional vector components
+    review_service = ReviewService(data_path, embedding_service, vector_store)
     review_service.load_reviews()
     
+    # Index embeddings if vector store is available
+    if vector_store and embedding_service:
+        try:
+            review_service.index_embeddings()
+        except Exception as e:
+            logger.warning(f"Failed to index embeddings: {str(e)}. Continuing with keyword search only.")
+    
+    # Initialize LLM service
     llm_service = LLMService()
     
     yield
@@ -130,13 +163,21 @@ async def query_llm(request: QueryRequest) -> QueryResponse:
         if "australia" in request.question.lower():
             location = "Australia"
         
-        # Search for relevant reviews
-        reviews = review_service.search_reviews(
-            query=request.question,
-            branch=branch,
-            location=location,
-            max_results=10
-        )
+        # Search for relevant reviews using hybrid search if available
+        if embedding_service and vector_store:
+            reviews = review_service.search_reviews_hybrid(
+                query=request.question,
+                branch=branch,
+                location=location,
+                max_results=10
+            )
+        else:
+            reviews = review_service.search_reviews(
+                query=request.question,
+                branch=branch,
+                location=location,
+                max_results=10
+            )
         
         # Query LLM with context
         answer = llm_service.query_with_context(request.question, reviews)
