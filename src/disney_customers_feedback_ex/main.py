@@ -1,33 +1,46 @@
 from __future__ import annotations
 
 import logging
-import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import JSONResponse
-from openai import OpenAI
 from pydantic import BaseModel
 
 from disney_customers_feedback_ex.core.logging import setup_logging
+from disney_customers_feedback_ex.services.llm_service import LLMService
+from disney_customers_feedback_ex.services.review_service import ReviewService
+
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
 
-logger = logging.getLogger(__name__)
-
-# Initialize OpenAI client
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Global services
+review_service: ReviewService | None = None
+llm_service: LLMService | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
+    global review_service, llm_service
+    
     # Startup
     setup_logging()
     logger.info("Disney Customer Feedback API starting up...")
+    
+    # Initialize services
+    data_path = Path(__file__).parent / "resources" / "DisneylandReviews.csv"
+    review_service = ReviewService(data_path)
+    review_service.load_reviews()
+    
+    llm_service = LLMService()
+    
     yield
+    
     # Shutdown
     logger.info("Disney Customer Feedback API shutting down...")
 
@@ -82,45 +95,63 @@ class QueryResponse(BaseModel):
     """Response model for LLM queries."""
     question: str
     answer: str
+    num_reviews_used: int
 
 
 @app.post("/query", response_model=QueryResponse)
 async def query_llm(request: QueryRequest) -> QueryResponse:
-    """Query the LLM with a question about Disney parks.
+    """Query the LLM with a question about Disney parks using review data.
     
     Args:
         request: The query request containing the question.
         
     Returns:
-        QueryResponse with the question and answer.
+        QueryResponse with the question, answer, and number of reviews used.
     """
+    if review_service is None or llm_service is None:
+        raise HTTPException(status_code=503, detail="Services not initialized")
+    
     logger.info(f"Query endpoint accessed with question: {request.question}")
     
     try:
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a helpful assistant that answers questions about Disney parks based on customer reviews."
-                },
-                {
-                    "role": "user",
-                    "content": request.question
-                }
-            ],
-            temperature=0.7,
-            max_tokens=500
+        # Extract potential filters from the question (simple keyword matching)
+        branch = None
+        location = None
+        
+        # Simple branch detection
+        if "hong kong" in request.question.lower():
+            branch = "Hong_Kong"
+        elif "california" in request.question.lower():
+            branch = "California"
+        elif "paris" in request.question.lower():
+            branch = "Paris"
+            
+        # Simple location detection
+        if "australia" in request.question.lower():
+            location = "Australia"
+        
+        # Search for relevant reviews
+        reviews = review_service.search_reviews(
+            query=request.question,
+            branch=branch,
+            location=location,
+            max_results=10
         )
         
-        answer = response.choices[0].message.content
-        logger.info(f"LLM response generated successfully")
+        # Query LLM with context
+        answer = llm_service.query_with_context(request.question, reviews)
         
-        return QueryResponse(question=request.question, answer=answer)
+        logger.info(f"Successfully generated answer using {len(reviews)} reviews")
+        
+        return QueryResponse(
+            question=request.question,
+            answer=answer,
+            num_reviews_used=len(reviews)
+        )
         
     except Exception as e:
-        logger.error(f"Error querying LLM: {str(e)}")
-        raise
+        logger.error(f"Error processing query: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 if __name__ == "__main__":

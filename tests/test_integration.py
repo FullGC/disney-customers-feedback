@@ -43,8 +43,11 @@ def test_query_endpoint() -> None:
     
     assert "question" in data
     assert "answer" in data
+    assert "num_reviews_used" in data
     assert data["question"] == "What is Disneyland?"
     assert len(data["answer"]) > 0
     assert isinstance(data["answer"], str)
+    assert isinstance(data["num_reviews_used"], int)
+    assert data["num_reviews_used"] >= 0
 
 
