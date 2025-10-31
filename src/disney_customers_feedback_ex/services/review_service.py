@@ -33,6 +33,17 @@ class ReviewService:
         self.embedding_service = embedding_service
         self.vector_store = vector_store
         self._embeddings_indexed = False
+    
+    def _normalize_text(self, text: str) -> str:
+        """Normalize text by removing special characters and converting to lowercase.
+        
+        Args:
+            text: Text to normalize.
+            
+        Returns:
+            Normalized text.
+        """
+        return text.lower().replace('_', '').replace('-', '').replace(' ', '')
         
     def load_reviews(self) -> None:
         """Load reviews from CSV file into memory."""
@@ -151,21 +162,8 @@ class ReviewService:
         Returns:
             List of relevant review dictionaries.
         """
-        if self.reviews_df is None:
-            raise ValueError("Reviews not loaded. Call load_reviews() first.")
-            
-        df = self.reviews_df.copy()
-        
-        # Apply filters
-        if branch:
-            # Normalize branch names by removing special characters for comparison
-            branch_normalized = branch.lower().replace('_', '').replace('-', '').replace(' ', '')
-            df = df[df['Branch'].fillna('').str.lower().str.replace('_', '').str.replace('-', '').str.replace(' ', '').str.contains(branch_normalized, case=False, na=False)]
-            
-        if location:
-            # Normalize location names by removing special characters for comparison
-            location_normalized = location.lower().replace('_', '').replace('-', '').replace(' ', '')
-            df = df[df['Reviewer_Location'].fillna('').str.lower().str.replace('_', '').str.replace('-', '').str.replace(' ', '').str.contains(location_normalized, case=False, na=False)]
+        # Use the shared filtering method
+        df = self._apply_filters(branch, location)
         
         # Check if dataframe is empty after filtering
         if df.empty:
@@ -217,9 +215,6 @@ class ReviewService:
         Returns:
             List of relevant review dictionaries with combined scores.
         """
-        if self.reviews_df is None:
-            raise ValueError("Reviews not loaded. Call load_reviews() first.")
-            
         # If vector search is not available, return keyword results only
         if self.embedding_service is None or self.vector_store is None or not self._embeddings_indexed:
             logger.info("Vector search not available, returning keyword results only")
@@ -272,13 +267,17 @@ class ReviewService:
                     query_embedding=query_embedding,
                     n_results=max_results * 3  # Get more to allow for filtering
                 )
+                
+                # Post-filter to only include reviews that match our pandas filters
+                candidate_indices = set(df.index)
+                semantic_results = [
+                    result for result in semantic_results 
+                    if int(result['id']) in candidate_indices
+                ]
             
-            # Holds only if there were not enough candidates to use ID filtering. Not sure this would be beneficial
-            # Convert semantic results to scores, only keeping candidates that match our pandas filters
-            #candidate_indices = set(df.index)
+            # Convert semantic results to scores
             for result in semantic_results:
                 doc_id = int(result['id'])
-                # if doc_id in candidate_indices:  # Only include if it matches our pandas filters
                 semantic_scores[doc_id] = result['similarity_score']
             
             logger.info(f"Semantic search found {len(semantic_scores)} scored reviews")
@@ -327,19 +326,34 @@ class ReviewService:
         return results
     
     def _apply_filters(self, branch: str | None = None, location: str | None = None) -> pd.DataFrame:
-        """Apply branch and location filters to the reviews DataFrame."""
+        """Apply branch and location filters to the reviews DataFrame.
+        
+        Args:
+            branch: Optional branch name to filter by.
+            location: Optional location to filter by.
+            
+        Returns:
+            Filtered DataFrame.
+        """
+        if self.reviews_df is None:
+            raise ValueError("Reviews not loaded. Call load_reviews() first.")
+            
         df = self.reviews_df.copy()
         
         if branch:
-            # Normalize branch for comparison
-            branch_normalized = branch.lower().replace('_', '').replace('-', '').replace(' ', '')
-            mask = df['Branch'].astype(str).str.lower().str.replace('_', '').str.replace('-', '').str.replace(' ', '').str.contains(branch_normalized, na=False)
+            # Normalize both the filter value and the column values for comparison
+            branch_normalized = self._normalize_text(branch)
+            mask = df['Branch'].fillna('').astype(str).apply(self._normalize_text).str.contains(
+                branch_normalized, case=False, na=False
+            )
             df = df[mask]
         
         if location:
-            # Normalize location for comparison  
-            location_normalized = location.lower().replace('_', '').replace('-', '').replace(' ', '')
-            mask = df['Reviewer_Location'].astype(str).str.lower().str.replace('_', '').str.replace('-', '').str.replace(' ', '').str.contains(location_normalized, na=False)
+            # Normalize both the filter value and the column values for comparison
+            location_normalized = self._normalize_text(location)
+            mask = df['Reviewer_Location'].fillna('').astype(str).apply(self._normalize_text).str.contains(
+                location_normalized, case=False, na=False
+            )
             df = df[mask]
             
         return df
