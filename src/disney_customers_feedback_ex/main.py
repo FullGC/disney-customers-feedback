@@ -4,6 +4,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 from pathlib import Path
+import os
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
@@ -18,6 +19,7 @@ from disney_customers_feedback_ex.services.embedding_service import EmbeddingSer
 from disney_customers_feedback_ex.services.llm_service import LLMService
 from disney_customers_feedback_ex.services.review_service import ReviewService
 from disney_customers_feedback_ex.services.vector_store import VectorStore
+from disney_customers_feedback_ex.services.cache_service import QueryCacheService
 
 logger = logging.getLogger(__name__)
 
@@ -29,12 +31,13 @@ review_service: ReviewService | None = None
 llm_service: LLMService | None = None
 embedding_service: EmbeddingService | None = None
 vector_store: VectorStore | None = None
+cache_service: QueryCacheService | None = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager."""
-    global review_service, llm_service, embedding_service, vector_store
+    global review_service, llm_service, embedding_service, vector_store, cache_service
     
     # Startup
     setup_logging()
@@ -50,6 +53,19 @@ async def lifespan(app: FastAPI):
     # Initialize embedding service
     embedding_service = EmbeddingService()
     embedding_service.load_model()
+    
+    # Initialize cache service with Redis
+    redis_host = os.getenv("REDIS_HOST", "localhost")
+    redis_port = int(os.getenv("REDIS_PORT", "6379"))
+    cache_service = QueryCacheService(
+        embedding_service=embedding_service,
+        redis_host=redis_host,
+        redis_port=redis_port,
+        redis_db=0,
+        similarity_threshold=0.95,
+        ttl_hours=24
+    )
+    logger.info(f"Cache service initialized with Redis at {redis_host}:{redis_port}")
     
     # Initialize vector store
     vector_store = VectorStore()
@@ -137,6 +153,36 @@ async def metrics() -> Response:
     return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
+@app.get("/cache/stats")
+async def cache_stats() -> JSONResponse:
+    """Get cache statistics.
+    
+    Returns:
+        JSONResponse with cache statistics.
+    """
+    if cache_service is None:
+        raise HTTPException(status_code=503, detail="Cache service not initialized")
+    
+    stats = cache_service.get_stats()
+    logger.info("Cache stats endpoint accessed")
+    return JSONResponse(content=stats)
+
+
+@app.post("/cache/clear")
+async def clear_cache() -> JSONResponse:
+    """Clear the query cache.
+    
+    Returns:
+        JSONResponse indicating success.
+    """
+    if cache_service is None:
+        raise HTTPException(status_code=503, detail="Cache service not initialized")
+    
+    cache_service.clear()
+    logger.info("Cache cleared via API endpoint")
+    return JSONResponse(content={"status": "success", "message": "Cache cleared"})
+
+
 class QueryRequest(BaseModel):
     """Request model for LLM queries."""
     question: str
@@ -147,6 +193,7 @@ class QueryResponse(BaseModel):
     question: str
     answer: str
     num_reviews_used: int
+    cached: bool = False
 
 
 @app.post("/query", response_model=QueryResponse)
@@ -171,6 +218,39 @@ async def query_llm(request: QueryRequest, fastapi_request: Request) -> QueryRes
     with tracer.start_as_current_span("query_endpoint") as span:
         try:
             span.set_attribute("question", request.question)
+            
+            # Check cache first
+            if cache_service:
+                cached_result = cache_service.get(request.question)
+                if cached_result:
+                    logger.info(f"Cache hit for question: {request.question}")
+                    span.set_attribute("cache_hit", True)
+                    
+                    # Record cache hit metrics
+                    app_metrics.record_cache_hit(cached_result.get("cache_similarity"))
+                    app_metrics.update_cache_size(len(cache_service.cache))
+                    
+                    duration = time.time() - start_time
+                    app_metrics.record_request(
+                        endpoint="/query",
+                        method="POST",
+                        status_code=200,
+                        duration=duration
+                    )
+                    
+                    return QueryResponse(
+                        question=request.question,
+                        answer=cached_result["answer"],
+                        num_reviews_used=cached_result["num_reviews_used"],
+                        cached=True
+                    )
+                else:
+                    logger.info(f"Cache miss for question: {request.question}")
+                    span.set_attribute("cache_hit", False)
+                    
+                    # Record cache miss metrics
+                    app_metrics.record_cache_miss()
+                    app_metrics.update_cache_size(len(cache_service.cache))
             
             # Extract potential filters from the question (simple keyword matching)
             branch = None
@@ -240,6 +320,12 @@ async def query_llm(request: QueryRequest, fastapi_request: Request) -> QueryRes
             
             logger.info(f"Successfully generated answer using {len(reviews)} reviews")
             
+            # Store in cache
+            if cache_service:
+                cache_service.set(request.question, answer, len(reviews))
+                app_metrics.update_cache_size(len(cache_service.cache))
+                logger.info(f"Stored answer in cache for question: {request.question}")
+            
             # Record request metrics
             duration = time.time() - start_time
             app_metrics.record_request(
@@ -252,7 +338,8 @@ async def query_llm(request: QueryRequest, fastapi_request: Request) -> QueryRes
             return QueryResponse(
                 question=request.question,
                 answer=answer,
-                num_reviews_used=len(reviews)
+                num_reviews_used=len(reviews),
+                cached=False
             )
             
         except Exception as e:

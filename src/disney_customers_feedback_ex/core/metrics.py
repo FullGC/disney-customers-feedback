@@ -89,6 +89,31 @@ candidate_count = meter.create_histogram(
     unit="1"
 )
 
+# Cache metrics
+cache_hit_count = meter.create_counter(
+    name="disney_api_cache_hit_count",
+    description="Total number of cache hits",
+    unit="1"
+)
+
+cache_miss_count = meter.create_counter(
+    name="disney_api_cache_miss_count",
+    description="Total number of cache misses",
+    unit="1"
+)
+
+cache_size = meter.create_gauge(
+    name="disney_api_cache_size",
+    description="Current number of entries in cache",
+    unit="1"
+)
+
+cache_similarity_score = meter.create_histogram(
+    name="disney_api_cache_similarity_score",
+    description="Similarity score for cache hits",
+    unit="1"
+)
+
 
 @contextmanager
 def measure_duration(histogram: metrics.Histogram, attributes: dict[str, str] | None = None) -> Generator[None, None, None]:
@@ -179,3 +204,28 @@ def record_hybrid_strategy(strategy: str, candidate_count_value: int) -> None:
     
     candidate_attributes = {"strategy": strategy}
     candidate_count.record(candidate_count_value, candidate_attributes)
+
+
+def record_cache_hit(similarity_score: float | None = None) -> None:
+    """Record cache hit metrics.
+    
+    Args:
+        similarity_score: Optional similarity score for the cache hit.
+    """
+    cache_hit_count.add(1)
+    if similarity_score is not None:
+        cache_similarity_score.record(similarity_score)
+
+
+def record_cache_miss() -> None:
+    """Record cache miss metrics."""
+    cache_miss_count.add(1)
+
+
+def update_cache_size(size: int) -> None:
+    """Update cache size gauge.
+    
+    Args:
+        size: Current cache size.
+    """
+    cache_size.set(size)

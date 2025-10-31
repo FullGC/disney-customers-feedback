@@ -17,6 +17,24 @@ services:
     networks:
       - disney-network
 
+  # Redis - Caching
+  redis:
+    image: redis:7-alpine
+    container_name: disney_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    restart: unless-stopped
+    networks:
+      - disney-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
   # OpenTelemetry Collector
   otel-collector:
     image: otel/opentelemetry-collector-contrib:latest
@@ -94,6 +112,8 @@ networks:
 
 volumes:
   chroma_data:
+    driver: local
+  redis-data:
     driver: local
   prometheus-data:
   grafana-data:
