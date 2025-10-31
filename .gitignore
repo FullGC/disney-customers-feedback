@@ -1,0 +1,14 @@
+# Byte-compiled files
+__pycache__/
+
+# Local environment files
+
+# Logs
+**.log
+
+# Cache
+!.vscode
+.vscode/*
+!.vscode/launch.json
+
+.venv/
