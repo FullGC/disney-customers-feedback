@@ -6,6 +6,7 @@ from typing import Any
 
 import pandas as pd
 
+from disney_customers_feedback_ex.core import metrics as app_metrics
 from disney_customers_feedback_ex.services.embedding_service import EmbeddingService
 from disney_customers_feedback_ex.services.vector_store import VectorStore
 
@@ -170,11 +171,15 @@ class ReviewService:
             logger.info(f"No reviews found matching filters for query: {query}")
             return []
         
-        # Simple text search in review text
-        query_lower = query.lower()
-        df['relevance'] = df['Review_Text'].fillna('').str.lower().apply(
-            lambda x: sum(word in x for word in query_lower.split())
-        )
+        # Simple text search in review text with metrics
+        with app_metrics.measure_duration(
+            app_metrics.keyword_search_duration,
+            {"has_filters": str(branch is not None or location is not None)}
+        ):
+            query_lower = query.lower()
+            df['relevance'] = df['Review_Text'].fillna('').str.lower().apply(
+                lambda x: sum(word in x for word in query_lower.split())
+            )
         
         # Sort by relevance and take top results
         top_reviews = df.nlargest(max_results, 'relevance')
@@ -240,7 +245,11 @@ class ReviewService:
         
         try:
             # Generate query embedding once
-            query_embedding = self.embedding_service.embed_text(query)
+            with app_metrics.measure_duration(
+                app_metrics.embedding_generation_duration,
+                {"operation": "query_embedding"}
+            ):
+                query_embedding = self.embedding_service.embed_text(query)
             
             # Decision: Use ID filtering if we have enough candidates to still get good results
             # We need at least 5x max_results candidates to ensure diversity after semantic filtering
@@ -249,24 +258,34 @@ class ReviewService:
             if len(df) >= min_candidates_threshold:
                 # Strategy A: Search with ID filtering (more efficient)
                 logger.info(f"Using ID-filtered search with {len(df)} candidates (>= {min_candidates_threshold} threshold)")
+                app_metrics.record_hybrid_strategy("id_filtered", len(df))
                 
                 candidate_ids = [str(idx) for idx in df.index]
                 
                 # Use ChromaDB's ids parameter to search within specific IDs
-                semantic_results = self.vector_store.search_similar(
-                    query_embedding=query_embedding,
-                    n_results=min(len(candidate_ids), max_results * 2),
-                    ids=candidate_ids
-                )
+                with app_metrics.measure_duration(
+                    app_metrics.chromadb_search_duration,
+                    {"strategy": "id_filtered"}
+                ):
+                    semantic_results = self.vector_store.search_similar(
+                        query_embedding=query_embedding,
+                        n_results=min(len(candidate_ids), max_results * 2),
+                        ids=candidate_ids
+                    )
                 
             else:
                 # Strategy B: Full search without ID filtering (better coverage)
                 logger.info(f"Using full search without ID filtering (only {len(df)} candidates < {min_candidates_threshold} threshold)")
+                app_metrics.record_hybrid_strategy("full_search", len(df))
                 
-                semantic_results = self.vector_store.search_similar(
-                    query_embedding=query_embedding,
-                    n_results=max_results * 3  # Get more to allow for filtering
-                )
+                with app_metrics.measure_duration(
+                    app_metrics.chromadb_search_duration,
+                    {"strategy": "full_search"}
+                ):
+                    semantic_results = self.vector_store.search_similar(
+                        query_embedding=query_embedding,
+                        n_results=max_results * 3  # Get more to allow for filtering
+                    )
                 
                 # Post-filter to only include reviews that match our pandas filters
                 candidate_indices = set(df.index)

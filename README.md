@@ -1,6 +1,6 @@
 # Disney Customer Feedback API 🏰
 
-A FastAPI application that answers natural language questions about Disney parks using customer reviews. The system uses hybrid search combining keyword matching and semantic similarity for improved results.
+A FastAPI application that answers natural language questions about Disney parks using customer reviews. The system uses hybrid search combining keyword matching and semantic similarity for improved results, with comprehensive monitoring and observability through OpenTelemetry, Prometheus, Jaeger, and Grafana.
 
 ## Features
 
@@ -10,6 +10,8 @@ A FastAPI application that answers natural language questions about Disney parks
 - 🤖 **LLM Integration**: Uses GPT-4o-mini for natural language responses
 - 📊 **Vector Database**: ChromaDB for semantic search capabilities
 - 🚀 **FastAPI**: Modern, fast API with automatic documentation
+- 📈 **Full Observability**: OpenTelemetry instrumentation with Prometheus metrics, Jaeger tracing, and Grafana dashboards
+- 🎯 **Performance Monitoring**: Track request latency, search strategies, component performance, and business metrics
 
 ## Quick Start
 
@@ -33,14 +35,19 @@ cp .env.example .env
 # Edit .env and add your OPENAI_API_KEY
 ```
 
-### 3. Start ChromaDB
+### 3. Start Services
 
 ```bash
-# Start ChromaDB with Docker Compose
+# Start all services (ChromaDB, Prometheus, Jaeger, Grafana, OpenTelemetry Collector)
 docker-compose up -d
 
-# Verify ChromaDB is running
-curl http://localhost:8001/api/v1/heartbeat
+# Verify all services are running
+docker-compose ps
+
+# Check service health
+curl http://localhost:8001/api/v1/heartbeat  # ChromaDB
+curl http://localhost:9090/-/ready           # Prometheus
+curl http://localhost:3000/api/health        # Grafana
 ```
 
 ### 4. Prepare Data
@@ -63,6 +70,18 @@ PYTHONPATH=src python src/disney_customers_feedback_ex/main.py
 Or use VS Code debugger (F5) with the "FastAPI: Run Server" configuration.
 
 ## API Usage
+
+### Access Points
+
+| Service | URL | Purpose |
+|---------|-----|---------|
+| **FastAPI** | http://localhost:8000 | Main API server |
+| **API Docs** | http://localhost:8000/docs | Swagger UI |
+| **Metrics** | http://localhost:8000/metrics | Prometheus metrics |
+| **Grafana** | http://localhost:3000 | Monitoring dashboards (admin/admin) |
+| **Prometheus** | http://localhost:9090 | Metrics database |
+| **Jaeger** | http://localhost:16687 | Distributed tracing |
+| **ChromaDB** | http://localhost:8001 | Vector database |
 
 ### Base URL
 ```
@@ -133,15 +152,68 @@ Visit the interactive API documentation:
 - **Swagger UI**: http://localhost:8000/docs
 - **ReDoc**: http://localhost:8000/redoc
 
+## Monitoring & Observability
+
+The application includes comprehensive monitoring and observability features. See detailed documentation:
+
+- **[Quick Start Guide](QUICK_START.md)** - Fast setup and common commands
+- **[Monitoring Implementation](MONITORING_IMPLEMENTATION.md)** - Technical details and architecture
+- **[Grafana Dashboard Guide](GRAFANA_DASHBOARD_GUIDE.md)** - How to use dashboards and interpret metrics
+- **[Metrics Reference](METRICS_REFERENCE.md)** - Complete list of available metrics
+
+### Key Metrics Tracked
+
+**Performance Metrics:**
+- Request latency (P50, P95, P99)
+- Component-level performance (ChromaDB, LLM, Embeddings, Keyword search)
+- Error rates and availability
+
+**Business Metrics:**
+- Search type distribution (hybrid vs keyword)
+- Hybrid search strategy selection (ID-filtered vs full search)
+- Reviews returned per query
+- Filter usage patterns (branch/location)
+
+### Quick Monitoring Test
+
+```bash
+# Run comprehensive monitoring test
+./test_e2e_monitoring.sh
+
+# Or test individual components
+curl http://localhost:8000/metrics | grep disney_feedback
+curl http://localhost:9090/api/v1/targets
+```
+
+### Viewing Metrics
+
+1. **Grafana Dashboard**: http://localhost:3000
+   - Login: admin/admin
+   - Look for "Disney Customer Feedback API - Performance Dashboard"
+   - Auto-refreshes every 5 seconds
+
+2. **Jaeger Traces**: http://localhost:16687
+   - Search for service: "disney-customer-feedback-api"
+   - View detailed request traces and performance breakdowns
+
+3. **Prometheus**: http://localhost:9090
+   - Query metrics directly
+   - View targets and scraping status
+
 ## Architecture
 
 ### System Components
 
-1. **FastAPI Server** - REST API endpoints
-2. **Review Service** - Loads and searches CSV data using pandas
+1. **FastAPI Server** - REST API endpoints with OpenTelemetry instrumentation
+2. **Review Service** - Loads and searches CSV data using pandas with performance metrics
 3. **Embedding Service** - Generates text embeddings using sentence-transformers
 4. **Vector Store** - ChromaDB for semantic similarity search
-5. **LLM Service** - OpenAI GPT-4o-mini integration
+5. **LLM Service** - OpenAI GPT-4o-mini integration with latency tracking
+6. **Monitoring Stack**:
+   - **OpenTelemetry Collector** - Aggregates telemetry data
+   - **Prometheus** - Metrics storage and querying
+   - **Jaeger** - Distributed tracing
+   - **Grafana** - Visualization and dashboarding
 
 ### Search Flow
 
@@ -178,11 +250,13 @@ pytest tests/ -k "test_query_endpoint" -v
 ```
 disney_customers_feedback_ex/
 ├── src/disney_customers_feedback_ex/
-│   ├── main.py                 # FastAPI application
+│   ├── main.py                 # FastAPI application with telemetry
 │   ├── core/
-│   │   └── logging.py          # Logging configuration  
+│   │   ├── logging.py          # Logging configuration
+│   │   ├── telemetry.py        # OpenTelemetry setup
+│   │   └── metrics.py          # Custom metrics definitions
 │   ├── services/
-│   │   ├── review_service.py   # CSV data loading & search
+│   │   ├── review_service.py   # CSV data loading & search (instrumented)
 │   │   ├── embedding_service.py # Text embedding generation
 │   │   ├── vector_store.py     # ChromaDB integration
 │   │   └── llm_service.py      # OpenAI integration
@@ -190,9 +264,22 @@ disney_customers_feedback_ex/
 │       └── DisneylandReviews.csv
 ├── tests/
 │   └── test_integration.py     # API integration tests
-├── docker-compose.yml          # ChromaDB setup
+├── grafana/
+│   ├── provisioning/           # Grafana datasources & dashboard config
+│   │   ├── datasources/
+│   │   └── dashboards/
+│   └── dashboards/             # Dashboard JSON files
+├── docker-compose.yml          # All services (ChromaDB, monitoring stack)
+├── prometheus.yml              # Prometheus configuration
+├── otel-collector-config.yaml # OpenTelemetry Collector config
+├── test_e2e_monitoring.sh     # End-to-end monitoring test
+├── test_monitoring.sh          # Basic monitoring test
 ├── pyproject.toml             # Dependencies
-└── README.md                  # This file
+├── README.md                  # This file
+├── QUICK_START.md             # Quick reference guide
+├── MONITORING_IMPLEMENTATION.md # Monitoring details
+├── GRAFANA_DASHBOARD_GUIDE.md  # Dashboard usage guide
+└── METRICS_REFERENCE.md        # Metrics documentation
 ```
 
 ### Adding New Features
@@ -212,19 +299,43 @@ disney_customers_feedback_ex/
    docker-compose ps
    
    # Restart if needed
-   docker-compose restart
+   docker-compose restart chromadb
    ```
 
-2. **CSV Encoding Issues**
+2. **Metrics Not Showing in Grafana**
+   ```bash
+   # Verify all monitoring services are running
+   docker-compose ps
+   
+   # Check Prometheus is scraping the app
+   curl http://localhost:9090/api/v1/targets
+   
+   # Verify metrics endpoint
+   curl http://localhost:8000/metrics | grep disney_feedback
+   
+   # Run comprehensive test
+   ./test_e2e_monitoring.sh
+   ```
+
+3. **Dashboard Not Loading**
+   ```bash
+   # Restart Grafana with fresh state
+   docker-compose stop grafana
+   docker-compose rm -f grafana
+   docker volume rm disney_customers_feedback_ex_grafana-data
+   docker-compose up -d grafana
+   ```
+
+4. **CSV Encoding Issues**
    - The system automatically tries multiple encodings (utf-8, latin-1, iso-8859-1, cp1252)
    - Check logs for which encoding was used
 
-3. **OpenAI API Errors**
+5. **OpenAI API Errors**
    - Verify your API key in `.env`
    - Check rate limits and billing status
 
-4. **Memory Issues with Large Datasets**
-   - Embeddings are generated in batches of 100
+6. **Memory Issues with Large Datasets**
+   - Embeddings are generated in batches of 3000
    - Consider reducing batch size for very large datasets
 
 ### Logs
@@ -239,8 +350,21 @@ Check application logs for detailed information:
 
 - **Embedding Generation**: Done once at startup, cached in ChromaDB
 - **Search Performance**: Pandas filtering is very fast for metadata, ChromaDB handles vector similarity
+- **Hybrid Search Strategies**: 
+  - ID-filtered search when sufficient candidates (>= 5x max_results)
+  - Full search with post-filtering for better coverage with fewer candidates
 - **Memory Usage**: Full dataset loaded in memory for fast filtering
 - **Scalability**: Current setup suitable for datasets up to ~100K reviews
+- **Monitoring Overhead**: OpenTelemetry adds ~1-5ms per request
+- **Metrics Export**: Batched every 5 seconds to minimize performance impact
+
+## Documentation
+
+- **[README.md](README.md)** - Main documentation (this file)
+- **[QUICK_START.md](QUICK_START.md)** - Quick reference for daily use
+- **[MONITORING_IMPLEMENTATION.md](MONITORING_IMPLEMENTATION.md)** - Technical monitoring details
+- **[GRAFANA_DASHBOARD_GUIDE.md](GRAFANA_DASHBOARD_GUIDE.md)** - Dashboard usage and metrics interpretation
+- **[METRICS_REFERENCE.md](METRICS_REFERENCE.md)** - Complete metrics catalog
 
 ## License
 

@@ -1,0 +1,181 @@
+"""Custom metrics for monitoring the Disney Customer Feedback API."""
+from __future__ import annotations
+
+import time
+from contextlib import contextmanager
+from typing import Generator
+
+from opentelemetry import metrics
+
+from disney_customers_feedback_ex.core.telemetry import get_meter
+
+# Get meter for custom metrics
+meter = get_meter(__name__)
+
+# Request metrics
+request_duration = meter.create_histogram(
+    name="disney_api_request_duration_seconds",
+    description="Request duration in seconds",
+    unit="s"
+)
+
+request_count = meter.create_counter(
+    name="disney_api_request_count",
+    description="Total number of API requests",
+    unit="1"
+)
+
+error_count = meter.create_counter(
+    name="disney_api_error_count",
+    description="Total number of errors",
+    unit="1"
+)
+
+# Search metrics
+search_type_count = meter.create_counter(
+    name="disney_api_search_type_count",
+    description="Count of searches by type (keyword/hybrid)",
+    unit="1"
+)
+
+reviews_returned = meter.create_histogram(
+    name="disney_api_reviews_returned",
+    description="Number of reviews returned per query",
+    unit="1"
+)
+
+# Component latency metrics
+chromadb_search_duration = meter.create_histogram(
+    name="disney_api_chromadb_search_duration_seconds",
+    description="ChromaDB vector search duration",
+    unit="s"
+)
+
+embedding_generation_duration = meter.create_histogram(
+    name="disney_api_embedding_generation_duration_seconds",
+    description="Embedding generation duration",
+    unit="s"
+)
+
+llm_inference_duration = meter.create_histogram(
+    name="disney_api_llm_inference_duration_seconds",
+    description="LLM inference duration",
+    unit="s"
+)
+
+keyword_search_duration = meter.create_histogram(
+    name="disney_api_keyword_search_duration_seconds",
+    description="Keyword search duration",
+    unit="s"
+)
+
+# Filter usage metrics
+filter_usage_count = meter.create_counter(
+    name="disney_api_filter_usage_count",
+    description="Count of filter usage by type",
+    unit="1"
+)
+
+# Hybrid search strategy metrics
+hybrid_strategy_count = meter.create_counter(
+    name="disney_api_hybrid_strategy_count",
+    description="Count of hybrid search strategy selection",
+    unit="1"
+)
+
+candidate_count = meter.create_histogram(
+    name="disney_api_candidate_count",
+    description="Number of candidates from pandas filtering",
+    unit="1"
+)
+
+
+@contextmanager
+def measure_duration(histogram: metrics.Histogram, attributes: dict[str, str] | None = None) -> Generator[None, None, None]:
+    """Context manager to measure duration and record to histogram.
+    
+    Args:
+        histogram: The histogram to record duration to.
+        attributes: Optional attributes to add to the measurement.
+        
+    Yields:
+        None
+    """
+    start_time = time.time()
+    try:
+        yield
+    finally:
+        duration = time.time() - start_time
+        histogram.record(duration, attributes=attributes or {})
+
+
+def record_request(endpoint: str, method: str, status_code: int, duration: float) -> None:
+    """Record API request metrics.
+    
+    Args:
+        endpoint: The API endpoint.
+        method: HTTP method.
+        status_code: HTTP status code.
+        duration: Request duration in seconds.
+    """
+    attributes = {
+        "endpoint": endpoint,
+        "method": method,
+        "status_code": str(status_code)
+    }
+    
+    request_count.add(1, attributes)
+    request_duration.record(duration, attributes)
+    
+    # Record errors
+    if status_code >= 400:
+        error_count.add(1, attributes)
+
+
+def record_search_type(search_type: str, has_filters: bool) -> None:
+    """Record search type metrics.
+    
+    Args:
+        search_type: Type of search (keyword, hybrid, semantic).
+        has_filters: Whether filters were applied.
+    """
+    attributes = {
+        "search_type": search_type,
+        "has_filters": str(has_filters)
+    }
+    search_type_count.add(1, attributes)
+
+
+def record_reviews_returned(count: int, search_type: str) -> None:
+    """Record number of reviews returned.
+    
+    Args:
+        count: Number of reviews returned.
+        search_type: Type of search performed.
+    """
+    attributes = {"search_type": search_type}
+    reviews_returned.record(count, attributes)
+
+
+def record_filter_usage(filter_type: str) -> None:
+    """Record filter usage.
+    
+    Args:
+        filter_type: Type of filter (branch, location, both).
+    """
+    attributes = {"filter_type": filter_type}
+    filter_usage_count.add(1, attributes)
+
+
+def record_hybrid_strategy(strategy: str, candidate_count_value: int) -> None:
+    """Record hybrid search strategy selection.
+    
+    Args:
+        strategy: Strategy used (id_filtered, full_search).
+        candidate_count_value: Number of candidates from pandas filtering.
+    """
+    strategy_attributes = {"strategy": strategy}
+    hybrid_strategy_count.add(1, strategy_attributes)
+    
+    candidate_attributes = {"strategy": strategy}
+    candidate_count.record(candidate_count_value, candidate_attributes)
