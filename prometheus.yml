@@ -1,0 +1,24 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  # Scrape metrics from OpenTelemetry Collector
+  - job_name: 'otel-collector'
+    static_configs:
+      - targets: ['otel-collector:8889']
+        labels:
+          service: 'disney-customer-feedback-api'
+
+  # Scrape metrics from the FastAPI app (we'll add this endpoint later)
+  - job_name: 'fastapi-app'
+    static_configs:
+      - targets: ['host.docker.internal:8000']
+        labels:
+          service: 'disney-customer-feedback-api'
+    metrics_path: '/metrics'
+
+  # Scrape Prometheus itself
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']
