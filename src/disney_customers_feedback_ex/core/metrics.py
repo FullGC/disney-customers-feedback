@@ -114,6 +114,38 @@ cache_similarity_score = meter.create_histogram(
     unit="1"
 )
 
+# Answer quality metrics
+answer_length = meter.create_histogram(
+    name="disney_api_answer_length",
+    description="Length of generated answers in characters",
+    unit="1"
+)
+
+reviews_used_count = meter.create_histogram(
+    name="disney_api_reviews_used_count",
+    description="Number of reviews used to generate answer",
+    unit="1"
+)
+
+user_feedback_count = meter.create_counter(
+    name="disney_api_user_feedback_count",
+    description="Count of user feedback by rating",
+    unit="1"
+)
+
+query_complexity_score = meter.create_histogram(
+    name="disney_api_query_complexity_score",
+    description="Estimated complexity of user query (0.0-1.0)",
+    unit="1"
+)
+
+# Retrieval quality metrics
+retrieval_precision = meter.create_histogram(
+    name="disney_api_retrieval_precision",
+    description="Precision of retrieved reviews (relevant/total)",
+    unit="1"
+)
+
 
 @contextmanager
 def measure_duration(histogram: metrics.Histogram, attributes: dict[str, str] | None = None) -> Generator[None, None, None]:
@@ -229,3 +261,47 @@ def update_cache_size(size: int) -> None:
         size: Current cache size.
     """
     cache_size.set(size)
+
+
+def record_answer_quality(answer: str, num_reviews_used: int) -> None:
+    """Record answer quality metrics.
+    
+    Args:
+        answer: The generated answer text.
+        num_reviews_used: Number of reviews used to generate the answer.
+    """
+    answer_length.record(len(answer))
+    reviews_used_count.record(num_reviews_used)
+
+
+def record_user_feedback(rating: str, question: str | None = None) -> None:
+    """Record user feedback on answers.
+    
+    Args:
+        rating: User rating (thumbs_up, thumbs_down).
+        question: Optional question text for context.
+    """
+    attributes = {"rating": rating}
+    user_feedback_count.add(1, attributes)
+
+
+def record_query_complexity(complexity: float, query_type: str) -> None:
+    """Record estimated query complexity.
+    
+    Args:
+        complexity: Complexity score (0.0 = simple, 1.0 = complex).
+        query_type: Type of query (simple, medium, complex).
+    """
+    attributes = {"query_type": query_type}
+    query_complexity_score.record(complexity, attributes)
+
+
+def record_retrieval_precision(precision: float, search_type: str) -> None:
+    """Record retrieval precision metric.
+    
+    Args:
+        precision: Precision score (relevant_reviews / total_reviews).
+        search_type: Type of search performed.
+    """
+    attributes = {"search_type": search_type}
+    retrieval_precision.record(precision, attributes)

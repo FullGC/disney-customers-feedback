@@ -17,6 +17,65 @@ class LLMService:
         if not api_key:
             raise ValueError("OPENAI_API_KEY environment variable not set")
         self.client = OpenAI(api_key=api_key)
+    
+    def estimate_query_complexity(self, question: str) -> tuple[float, str]:
+        """Estimate the complexity of a user query.
+        
+        Complexity is based on:
+        - Question length
+        - Number of clauses/entities
+        - Comparative/analytical nature
+        - Multiple filters/conditions
+        
+        Args:
+            question: The user's question.
+            
+        Returns:
+            Tuple of (complexity_score, complexity_type)
+            - complexity_score: 0.0 (simple) to 1.0 (complex)
+            - complexity_type: "simple", "medium", or "complex"
+        """
+        score = 0.0
+        
+        # Length factor (0-0.2)
+        word_count = len(question.split())
+        if word_count > 20:
+            score += 0.2
+        elif word_count > 10:
+            score += 0.1
+        
+        # Comparative/analytical keywords (0-0.3)
+        comparative_words = ["compare", "versus", "vs", "better", "worse", "difference", "similar"]
+        analytical_words = ["why", "how", "analyze", "trend", "pattern", "correlation"]
+        
+        question_lower = question.lower()
+        if any(word in question_lower for word in comparative_words):
+            score += 0.2
+        if any(word in question_lower for word in analytical_words):
+            score += 0.3
+        
+        # Multiple entities/filters (0-0.3)
+        branches = ["california", "hong kong", "paris"]
+        branch_count = sum(1 for branch in branches if branch in question_lower)
+        if branch_count > 1:
+            score += 0.3
+        elif branch_count == 1:
+            score += 0.1
+        
+        # Question marks/multiple questions (0-0.2)
+        question_marks = question.count("?")
+        if question_marks > 1:
+            score += 0.2
+        
+        # Determine complexity type
+        if score < 0.3:
+            complexity_type = "simple"
+        elif score < 0.7:
+            complexity_type = "medium"
+        else:
+            complexity_type = "complex"
+        
+        return min(score, 1.0), complexity_type
         
     def query_with_context(
         self,

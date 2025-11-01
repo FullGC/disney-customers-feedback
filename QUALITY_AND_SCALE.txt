@@ -1,0 +1,69 @@
+QUALITY EVALUATION & SCALE HANDLING
+====================================
+
+QUALITY EVALUATION
+------------------
+
+Answer Quality Metrics:
+• Semantic similarity against reference answers (threshold: ?)
+• LLM-as-a-judge for factual consistency checking
+• Human evaluation
+• Track: answer completeness, citation coverage, user feedback (thumbs up/down)
+
+Retrieval Quality:
+• Test: out of all the relevant reviews that exist, how many did we find in the top 10 results? (against labeled test set)
+• Track precision: % of retrieved reviews actually relevant to query
+
+System Quality:
+• SLIs: P95 latency < 3s, in-server-only latency < 100ms, unexpected error rate < 0.1%, cache hit rate > 60%
+• Monitor data freshness, missing fields, duplicates
+• Alert on performance degradation or answer quality drops
+
+
+SCALE HANDLING
+--------------
+
+Traffic Scaling (100 → 100K queries/day):
+• Horizontal auto-scaling: 2-20 API instances behind load balancer
+• Redis cluster: 3 master + 3 replica nodes with consistent hashing
+• Rate limiting: 100 req/hour per user, 2000 req/min globally
+• Target: 80% cache hit rate = 80% cost reduction
+
+Data Scaling (42K → 4M reviews):
+• Switch to managed vector DB ? 
+• Shard by branch (California, Hong Kong, Paris)?
+• Incremental indexing: only embed new/modified reviews every 6 hours
+
+Cost Optimization (LLM):
+• Current: let's say $0.002/query → At 100K/day: $6K/month
+• With 80% cache hit rate: $1.2K/month
+• Additional optimizations:
+  - Use top 5 reviews instead of 10 (50% token reduction)
+
+Database Scaling:
+• ?
+
+Future Architecutre 
+
+Async Request Processing Architecture (for high throughput):
+• Client sends query → API publishes to Kafka topic "queries"
+• API immediately returns request_id and WebSocket connection URL
+• Worker pool consumes from Kafka, processes queries in parallel
+• Workers publish results to Kafka topic "responses" 
+• WebSocket service subscribes to responses, pushes answer to client in real-time
+• Benefits:
+  - Decouple API from LLM latency (API responds in <100ms)
+  - Handle traffic spikes: Kafka buffers requests during peaks
+  - Scale workers independently based on queue depth
+  - Retry failed queries without client impact
+  - Client gets immediate acknowledgment, then streams answer when ready
+
+** Something like that, haven't really thought this though.
+
+SUCCESS METRICS (3 months at scale)
+------------------------------------
+• 99.9% uptime
+• P95 latency: < 2s (cached), < 4s (uncached)
+• Cache hit rate > ?
+• Answer quality score ?
+• Cost per query < ?

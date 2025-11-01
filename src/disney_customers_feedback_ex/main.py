@@ -118,6 +118,13 @@ class QueryResponse(BaseModel):
     cached: bool = False
 
 
+class FeedbackRequest(BaseModel):
+    """Request model for user feedback."""
+    question: str
+    rating: str  # "thumbs_up" or "thumbs_down"
+    comment: str | None = None
+
+
 @app.post("/query", response_model=QueryResponse)
 async def query_llm(request: QueryRequest, fastapi_request: Request) -> QueryResponse:
     """Query the LLM with a question about Disney parks using review data.
@@ -144,6 +151,11 @@ async def query_llm(request: QueryRequest, fastapi_request: Request) -> QueryRes
     vector_store = get_vector_store()
     
     logger.info(f"Query endpoint accessed with question: {request.question}")
+    
+    # Estimate query complexity
+    complexity_score, complexity_type = llm_service.estimate_query_complexity(request.question)
+    app_metrics.record_query_complexity(complexity_score, complexity_type)
+    logger.info(f"Query complexity: {complexity_type} (score: {complexity_score:.2f})")
     
     with tracer.start_as_current_span("query_endpoint") as span:
         try:
@@ -248,6 +260,9 @@ async def query_llm(request: QueryRequest, fastapi_request: Request) -> QueryRes
                 
                 llm_span.set_attribute("answer_length", len(answer))
             
+            # Record answer quality metrics
+            app_metrics.record_answer_quality(answer, len(reviews))
+            
             logger.info(f"Successfully generated answer using {len(reviews)} reviews")
             
             # Store in cache
@@ -288,6 +303,39 @@ async def query_llm(request: QueryRequest, fastapi_request: Request) -> QueryRes
             span.set_attribute("error_message", str(e))
             
             raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/feedback")
+async def submit_feedback(request: FeedbackRequest) -> JSONResponse:
+    """Submit user feedback on an answer.
+    
+    Args:
+        request: The feedback request containing question, rating, and optional comment.
+        
+    Returns:
+        JSONResponse indicating feedback was recorded.
+    """
+    # Validate rating
+    if request.rating not in ["thumbs_up", "thumbs_down"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Rating must be 'thumbs_up' or 'thumbs_down'"
+        )
+    
+    # Record feedback metric
+    app_metrics.record_user_feedback(request.rating, request.question)
+    
+    logger.info(
+        f"Feedback received: {request.rating} for question '{request.question[:50]}...'"
+    )
+    
+    return JSONResponse(
+        content={
+            "status": "success",
+            "message": "Feedback recorded successfully",
+            "rating": request.rating
+        }
+    )
 
 
 if __name__ == "__main__":

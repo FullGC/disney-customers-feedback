@@ -257,6 +257,30 @@ curl http://localhost:9090/api/v1/targets
    - **LLM Generation** - Send context to GPT-4o-mini for answer generation
 4. **Cache Store** - Save question-answer pair to Redis for future similar queries
 
+### Design Decisions: What Was Left Out
+
+During development, several approaches were considered but ultimately not implemented:
+
+**Cache Similarity Matching**
+- **Considered**: Using LLM to determine if a cached question matches the user's query
+  - Pros: More nuanced understanding of question similarity
+  - Cons: Added latency, API costs, increased complexity
+- **Decision**: Use embedding-based cosine similarity (current implementation)
+  - Rationale: Fast, free after initial embedding generation, highly accurate for semantic similarity (threshold ≥ 0.95)
+  - Trade-off: May miss some paraphrased questions that LLM would catch, but 95% similarity threshold is quite effective
+
+**Intent Extraction for Filters**
+- **Considered**: Using embeddings or LLM to extract branch/location when pandas filtering fails
+  - Approach 1: Semantic matching - embed location names and find closest match
+  - Approach 2: LLM extraction - ask the model to identify locations in free text
+  - Pros: Could handle misspellings, abbreviations, or fuzzy matches
+  - Cons: Additional latency, complexity, and potential false positives
+- **Decision**: Rely solely on pandas text filtering with normalization
+  - Rationale: Current approach is fast, handles common variations via normalization (lowercase, remove special chars), and users typically use clear location names
+  - Trade-off: May miss creative phrasings like "the park in France" instead of "Paris", but keeps system simple and predictable
+
+These decisions prioritize **speed, cost-efficiency, and simplicity** while maintaining high accuracy for the majority of use cases.
+
 ## Query Flow Details
 
 This section provides a step-by-step breakdown of how a user query flows through the system, including all services, components, and features involved.
@@ -870,6 +894,7 @@ Check application logs for detailed information:
 - **[MONITORING_IMPLEMENTATION.md](MONITORING_IMPLEMENTATION.md)** - Technical monitoring details
 - **[GRAFANA_DASHBOARD_GUIDE.md](GRAFANA_DASHBOARD_GUIDE.md)** - Dashboard usage and metrics interpretation
 - **[METRICS_REFERENCE.md](METRICS_REFERENCE.md)** - Complete metrics catalog
+- **[QUALITY_AND_SCALE.txt](QUALITY_AND_SCALE.txt)** - Quality evaluation and scaling strategy
 
 ## License
 
