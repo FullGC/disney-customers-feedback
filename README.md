@@ -242,7 +242,7 @@ curl http://localhost:9090/api/v1/targets
    - **Redis** - Query cache with automatic expiration (24h TTL)
    - **ChromaDB** - Vector embeddings for semantic search
 
-### Search Flow
+### Search Flow Overview
 
 1. **Cache Check** - Check Redis for similar cached questions (cosine similarity ≥ 0.95)
 2. **Cache Hit** - Return cached answer instantly (no LLM call needed)
@@ -257,22 +257,453 @@ curl http://localhost:9090/api/v1/targets
    - **LLM Generation** - Send context to GPT-4o-mini for answer generation
 4. **Cache Store** - Save question-answer pair to Redis for future similar queries
 
+## Query Flow Details
+
+This section provides a step-by-step breakdown of how a user query flows through the system, including all services, components, and features involved.
+
+### Flow Diagram
+
+```mermaid
+flowchart TD
+    Start([User Query]) --> API[Step 1: FastAPI Endpoint<br/>/query]
+    API --> Validate[Step 2: Service Check<br/>get_review_service<br/>get_llm_service<br/>get_cache_service]
+    Validate -->|Services OK| EmbedQuery[Step 3: Generate Query Embedding<br/>EmbeddingService<br/>384-dim vector<br/>~20-50ms]
+    Validate -->|Missing Services| Error503[HTTP 503 Error]
+    
+    EmbedQuery --> CacheSearch[Step 4: Search Redis Cache<br/>Compare embeddings<br/>Cosine similarity<br/>~10-30ms]
+    
+    CacheSearch --> CacheDecision{Step 5: Cache Decision<br/>Similarity ≥ 0.95?}
+    CacheDecision -->|YES - Cache HIT| CacheReturn[Return Cached Answer<br/>cached=true<br/>~50-100ms total<br/>$0 cost]
+    CacheDecision -->|NO - Cache MISS| ExtractIntent[Step 6: Extract Query Intent<br/>LLM Service → OpenAI<br/>Extract branch/location<br/>~500-1500ms<br/>~$0.0002]
+    
+    CacheReturn --> End([Response to User])
+    
+    ExtractIntent --> PandasFilter[Step 7: Apply Metadata Filters<br/>ReviewService._apply_filters<br/>Pandas DataFrame ops<br/>~5-20ms]
+    
+    PandasFilter --> KeywordScore[Step 8: Keyword Scoring<br/>Word overlap + phrase boost<br/>~10-100ms]
+    
+    KeywordScore --> StrategyDecision{Step 9: Hybrid Strategy<br/>Candidates ≥ threshold?}
+    
+    StrategyDecision -->|YES ≥ 5x| IDFiltered[ID-Filtered Strategy]
+    StrategyDecision -->|NO < 5x| FullSearch[Full Search Strategy]
+    
+    IDFiltered --> EmbedSemantic[Step 10: Generate Embedding<br/>for Semantic Search<br/>~20-50ms]
+    FullSearch --> EmbedSemantic
+    
+    EmbedSemantic --> VectorSearch[Step 11: ChromaDB Vector Search]
+    
+    VectorSearch -->|ID-Filtered| VectorID[Search within candidate IDs<br/>HNSW index<br/>~50-200ms]
+    VectorSearch -->|Full Search| VectorFull[Search entire collection<br/>Post-filter results<br/>~100-500ms]
+    
+    VectorID --> ScoreCombine[Step 12: Score Combination<br/>40% keyword + 60% semantic<br/>Sort by combined score]
+    VectorFull --> ScoreCombine
+    
+    ScoreCombine --> FormatContext[Step 13: Format Review Context<br/>Top 10 reviews<br/>Extract metadata<br/>Truncate text to 500 chars]
+    
+    FormatContext --> BuildPrompt[Step 14: Build LLM Prompt<br/>System + user messages<br/>Inject review context]
+    
+    BuildPrompt --> CallLLM[Step 15: Call OpenAI API<br/>GPT-4o-mini<br/>Temperature: 0.7<br/>Max tokens: 500<br/>~1000-3000ms<br/>~$0.001-0.003]
+    
+    CallLLM --> StoreCache[Step 16: Store in Redis Cache<br/>SHA256 hash key<br/>24h TTL<br/>~5-10ms]
+    
+    StoreCache --> FormatResponse[Step 17: Format Response JSON<br/>question + answer<br/>num_reviews_used<br/>cached=false]
+    
+    FormatResponse --> RecordMetrics[Step 18: Record Metrics & Traces<br/>OpenTelemetry spans<br/>Prometheus metrics<br/>~1-5ms overhead]
+    
+    RecordMetrics --> End
+    
+    style Start fill:#e1f5ff
+    style End fill:#e1ffe1
+    style CacheReturn fill:#90EE90
+    style Error503 fill:#ffcccc
+    style CacheDecision fill:#fff4e1
+    style StrategyDecision fill:#fff4e1
+    style EmbedQuery fill:#e8d5ff
+    style EmbedSemantic fill:#e8d5ff
+    style CacheSearch fill:#ffe8d5
+    style StoreCache fill:#ffe8d5
+    style VectorSearch fill:#d5f5ff
+    style VectorID fill:#d5f5ff
+    style VectorFull fill:#d5f5ff
+    style ExtractIntent fill:#ffe8f0
+    style CallLLM fill:#ffe8f0
+```
+
+### Simplified Overview
+
+```
+User Query → FastAPI → Cache Service → Review Service → LLM Service → Response
+                ↓           ↓              ↓               ↓           ↓
+            Telemetry   Redis Cache   Hybrid Search   OpenAI API   Metrics
+                           ↓              ↓
+                      Embeddings    Vector Store
+                                    (ChromaDB)
+```
+
+### Detailed Step-by-Step Flow
+
+#### **Phase 1: Request Reception**
+
+**Step 1: API Endpoint Receives Request**
+- **Component**: `main.py` - `/query` endpoint
+- **Input**: JSON payload with `question` field
+- **Actions**:
+  - FastAPI validates the request schema
+  - OpenTelemetry creates a new trace span
+  - Request timestamp is recorded
+- **Features Used**: FastAPI request validation, OpenTelemetry instrumentation
+- **Metrics**: `disney_feedback_requests_total` counter incremented
+
+**Step 2: Service Initialization Check**
+- **Component**: `main.py` - Service getter functions
+- **Actions**:
+  - Calls `get_review_service()`, `get_llm_service()`, `get_cache_service()`
+  - Validates all required services are initialized
+  - Returns HTTP 503 if critical services unavailable
+- **Features Used**: Service dependency injection, health checks
+- **Error Handling**: RuntimeError if services not initialized
+
+---
+
+#### **Phase 2: Cache Check (Semantic Similarity)**
+
+**Step 3: Generate Query Embedding**
+- **Component**: `cache_service.py` → `EmbeddingService`
+- **Actions**:
+  - Calls `embedding_service.embed_text(question)`
+  - Generates 384-dimensional vector using `sentence-transformers/all-MiniLM-L6-v2`
+  - Embedding represents semantic meaning of the question
+- **Features Used**: Transformer-based embeddings, GPU acceleration (if available)
+- **Metrics**: `disney_feedback_embedding_duration_seconds` histogram
+- **Duration**: ~20-50ms
+
+**Step 4: Search Redis Cache**
+- **Component**: `cache_service.py` - `get()` method
+- **Actions**:
+  - Retrieves all cached question embeddings from Redis
+  - Computes cosine similarity between query and each cached embedding
+  - Finds best match with similarity score
+- **Features Used**: 
+  - Redis `SMEMBERS` to get all cache keys
+  - Redis `GET` for each embedding (pipeline for efficiency)
+  - NumPy cosine similarity calculation
+- **Metrics**: 
+  - `disney_feedback_cache_lookups_total` counter
+  - `disney_feedback_cache_similarity_score` histogram
+- **Duration**: ~10-30ms for 100 cached entries
+
+**Step 5: Cache Decision**
+- **Component**: `cache_service.py`
+- **Decision Logic**:
+  - **If similarity ≥ 0.95**: Cache HIT - Return cached answer
+  - **If similarity < 0.95**: Cache MISS - Proceed to full search
+- **Actions on HIT**:
+  - Retrieve cached answer from Redis using `disney_cache:{hash}` key
+  - Set `cached=true` in response
+  - Skip all remaining steps (Steps 6-16)
+  - Return response immediately
+- **Actions on MISS**:
+  - Continue to Phase 3
+- **Metrics**: 
+  - `disney_feedback_cache_hits_total` (on hit)
+  - `disney_feedback_cache_misses_total` (on miss)
+- **Performance**: Cache hits save ~2-5 seconds and $0.001-0.003 in API costs
+
+---
+
+#### **Phase 3: Review Search (Cache Miss Path)**
+
+**Step 6: Extract Query Intent**
+- **Component**: `llm_service.py` - `extract_query_intent()` method
+- **Actions**:
+  - Sends question to OpenAI GPT-4o-mini
+  - LLM analyzes question to extract:
+    - `branch` (e.g., "California", "Hong Kong", "Paris")
+    - `location` (reviewer location, e.g., "Australia", "UK")
+  - Returns structured filters as dictionary
+- **Features Used**: 
+  - OpenAI API (GPT-4o-mini)
+  - Structured prompt engineering
+  - JSON response parsing
+- **Metrics**: 
+  - `disney_feedback_llm_duration_seconds` histogram
+  - `disney_feedback_llm_calls_total{operation="extract_intent"}` counter
+- **Duration**: ~500-1500ms
+- **Cost**: ~$0.0002 per query
+
+**Step 7: Apply Metadata Filters (Pandas)**
+- **Component**: `review_service.py` - `_apply_filters()` method
+- **Input**: Full DataFrame (42,000+ reviews) + branch/location filters
+- **Actions**:
+  - Normalizes filter values (lowercase, remove special chars)
+  - Filters DataFrame by branch (if specified)
+  - Filters DataFrame by reviewer location (if specified)
+  - Returns filtered candidate reviews
+- **Features Used**: 
+  - Pandas DataFrame operations
+  - Case-insensitive text matching
+  - Normalized text comparison
+- **Metrics**: `disney_feedback_filter_usage_total{filter_type="branch|location"}` counter
+- **Duration**: ~5-20ms
+- **Output**: Typically 100-5,000 candidate reviews
+
+**Step 8: Keyword Relevance Scoring**
+- **Component**: `review_service.py` - `_calculate_keyword_scores()` method
+- **Actions**:
+  - Tokenizes query into words
+  - For each candidate review:
+    - Calculates word overlap score
+    - Applies phrase match boost (1.5x if exact phrase found)
+    - Generates relevance score (0.0-1.5)
+  - Returns dictionary of {review_id: keyword_score}
+- **Features Used**: 
+  - Text tokenization
+  - Set intersection for word overlap
+  - Phrase matching bonus
+- **Metrics**: `disney_feedback_keyword_search_duration_seconds` histogram
+- **Duration**: ~10-100ms depending on candidate count
+
+**Step 9: Hybrid Search Strategy Selection**
+- **Component**: `review_service.py` - `search_reviews_hybrid()` method
+- **Decision Logic**:
+  - Calculate threshold: `min_candidates_threshold = max_results × 5`
+  - **If candidates ≥ threshold**: Use "ID-filtered" strategy
+  - **If candidates < threshold**: Use "full search" strategy
+- **Rationale**:
+  - ID-filtered is more efficient but needs sufficient candidates
+  - Full search ensures good results with fewer candidates
+- **Metrics**: `disney_feedback_hybrid_strategy_total{strategy="id_filtered|full_search"}` counter
+
+**Step 10: Generate Query Embedding (for Semantic Search)**
+- **Component**: `review_service.py` → `EmbeddingService`
+- **Actions**:
+  - Same as Step 3 but for semantic search (may reuse if already generated)
+  - Creates semantic representation of query
+- **Metrics**: `disney_feedback_embedding_duration_seconds{operation="query_embedding"}` histogram
+- **Duration**: ~20-50ms
+
+**Step 11: Vector Similarity Search**
+- **Component**: `vector_store.py` → ChromaDB
+- **Actions**:
+  - **ID-filtered strategy**:
+    - Sends query embedding + list of candidate IDs to ChromaDB
+    - ChromaDB searches only within specified IDs
+    - Returns top N results (N = max_results × 2)
+  - **Full search strategy**:
+    - Sends query embedding to ChromaDB (no ID filter)
+    - ChromaDB searches entire collection
+    - Returns top N results (N = max_results × 3)
+    - Post-filters results to match pandas filters
+  - For each result, returns:
+    - Document ID
+    - Similarity score (0.0-1.0)
+    - Review metadata
+- **Features Used**: 
+  - ChromaDB cosine similarity search
+  - HNSW (Hierarchical Navigable Small World) index
+  - Metadata filtering
+- **Metrics**: 
+  - `disney_feedback_chromadb_search_duration_seconds{strategy="id_filtered|full_search"}` histogram
+  - `disney_feedback_reviews_returned_total` histogram
+- **Duration**: 
+  - ID-filtered: ~50-200ms
+  - Full search: ~100-500ms
+
+**Step 12: Score Combination**
+- **Component**: `review_service.py` - `search_reviews_hybrid()` method
+- **Actions**:
+  - For each review in candidate set:
+    - Get keyword_score (from Step 8)
+    - Get semantic_score (from Step 11)
+    - Calculate: `combined_score = (0.4 × keyword_score) + (0.6 × semantic_score)`
+  - Sorts reviews by combined score (descending)
+  - Selects top N reviews (N = max_results, default 10)
+- **Features Used**: Weighted score fusion
+- **Weights**: 40% keyword, 60% semantic (tunable)
+- **Output**: Top 10 most relevant reviews with scores
+
+**Step 13: Format Review Context**
+- **Component**: `review_service.py`
+- **Actions**:
+  - Extracts metadata for each selected review:
+    - Branch (park location)
+    - Rating (1-5 stars)
+    - Year/Month
+    - Reviewer location
+    - Review text (truncated to 500 chars)
+  - Formats as structured JSON array
+- **Output**: List of review dictionaries ready for LLM context
+
+---
+
+#### **Phase 4: LLM Answer Generation**
+
+**Step 14: Build LLM Prompt**
+- **Component**: `llm_service.py` - `answer_question()` method
+- **Actions**:
+  - Creates system prompt with instructions
+  - Formats user prompt with:
+    - Original question
+    - Number of reviews found
+    - Formatted review context
+  - Constructs messages array for OpenAI Chat API
+- **Features Used**: 
+  - Prompt engineering
+  - Few-shot learning patterns
+  - Context injection
+
+**Step 15: Call OpenAI API**
+- **Component**: `llm_service.py` → OpenAI API
+- **Actions**:
+  - Sends messages to GPT-4o-mini via `openai.chat.completions.create()`
+  - Parameters:
+    - Model: `gpt-4o-mini`
+    - Temperature: 0.7
+    - Max tokens: 500
+  - Receives generated answer
+- **Features Used**: 
+  - OpenAI Chat Completions API
+  - Token usage tracking
+- **Metrics**: 
+  - `disney_feedback_llm_duration_seconds{operation="answer_generation"}` histogram
+  - `disney_feedback_llm_calls_total{operation="answer_generation"}` counter
+- **Duration**: ~1000-3000ms
+- **Cost**: ~$0.001-0.003 per query (varies by context size)
+
+**Step 16: Store Result in Cache**
+- **Component**: `cache_service.py` - `set()` method
+- **Actions**:
+  - Generates SHA256 hash from question text
+  - Stores in Redis:
+    - `disney_cache:{hash}` → {question, answer, num_reviews_used, timestamp}
+    - `disney_embedding:{hash}` → 384-dimensional embedding vector
+    - Adds hash to `disney_cache_keys` set
+  - Sets 24-hour TTL (86400 seconds)
+- **Features Used**: 
+  - Redis SETEX for atomic set with expiration
+  - Redis SADD for set management
+  - JSON serialization for complex data
+- **Metrics**: `disney_feedback_cache_size` gauge incremented
+- **Duration**: ~5-10ms
+
+---
+
+#### **Phase 5: Response Delivery**
+
+**Step 17: Format Response**
+- **Component**: `main.py` - `/query` endpoint
+- **Actions**:
+  - Constructs response JSON:
+    ```json
+    {
+      "question": "...",
+      "answer": "...",
+      "num_reviews_used": 10,
+      "cached": false
+    }
+    ```
+  - Sets appropriate HTTP headers
+  - Logs response details
+- **Features Used**: FastAPI response models, Pydantic validation
+
+**Step 18: Record Metrics & Traces**
+- **Component**: OpenTelemetry, Prometheus
+- **Actions**:
+  - Finalizes trace span with duration
+  - Records all custom metrics:
+    - Request latency (end-to-end)
+    - Cache performance
+    - Search strategy used
+    - Component durations
+    - Review count
+  - Exports to OpenTelemetry Collector
+- **Features Used**: 
+  - Distributed tracing
+  - Custom metrics
+  - Context propagation
+- **Duration**: ~1-5ms overhead
+
+**Step 19: Return to Client**
+- **Component**: FastAPI / ASGI server
+- **Actions**:
+  - Sends HTTP 200 response with JSON body
+  - Closes connection
+- **Total Duration**:
+  - **Cache Hit**: ~50-100ms
+  - **Cache Miss**: ~2000-5000ms
+
+---
+
+### Performance Characteristics by Path
+
+| Scenario | Cache | Embeddings | Vector Search | LLM Calls | Total Duration | Cost |
+|----------|-------|------------|---------------|-----------|----------------|------|
+| **Cache Hit** | ✅ Hit | 1 (query) | ❌ Skip | ❌ Skip | ~50-100ms | $0 |
+| **Cache Miss (Hybrid)** | ❌ Miss | 2 (query + cache) | ✅ Yes | 2 (intent + answer) | ~2-5s | ~$0.002 |
+| **Cache Miss (Keyword)** | ❌ Miss | 1 (cache) | ❌ Fallback | 2 (intent + answer) | ~1.5-3s | ~$0.002 |
+
+### Services & Components Summary
+
+| Service/Component | Purpose | Technology | When Used |
+|-------------------|---------|------------|-----------|
+| **FastAPI** | HTTP API server | FastAPI, Uvicorn | Every request |
+| **Cache Service** | Semantic caching | Redis, NumPy | Every request |
+| **Embedding Service** | Text → vectors | sentence-transformers | Cache check + semantic search |
+| **Vector Store** | Similarity search | ChromaDB | Semantic search (if available) |
+| **Review Service** | Data filtering & search | Pandas | Every cache miss |
+| **LLM Service** | Intent extraction & answer generation | OpenAI GPT-4o-mini | Every cache miss |
+| **Telemetry** | Monitoring & tracing | OpenTelemetry, Prometheus, Jaeger | Every request |
+| **Metrics** | Performance tracking | Prometheus | Continuous |
+
+### Key Features Along the Flow
+
+1. **Semantic Caching**: Understands similar questions (not just exact matches)
+2. **Hybrid Search**: Combines keyword and semantic approaches for best results
+3. **Dynamic Strategy Selection**: Adapts search strategy based on candidate count
+4. **Metadata Filtering**: Fast pandas-based filtering before expensive vector search
+5. **Score Fusion**: Weighted combination of keyword and semantic relevance
+6. **Cost Optimization**: Cache hits avoid LLM API calls (~$0.002 saved per hit)
+7. **Comprehensive Monitoring**: Every step instrumented with metrics and traces
+8. **Graceful Degradation**: Falls back to keyword search if vector store unavailable
+9. **Batch Processing**: Embeddings indexed in batches during startup
+10. **TTL Management**: Automatic cache expiration after 24 hours
+
 ## Testing
 
-### Run Integration Tests
+The project includes comprehensive integration tests covering:
+
+- **40+ test cases** covering all functionality
+- Basic endpoints (health, metrics, cache)
+- Query processing with various filters
+- Semantic caching functionality
+- Edge cases and error handling
+- Performance benchmarks
+- Parametrized tests for branches and topics
+
+### Run Tests
 
 ```bash
-# Start the server first, then run tests
-source env_disney_customers_feedback_ex/bin/activate
+# Start services
+docker-compose up -d
+
+# Start the API (in another terminal)
+python -m uvicorn disney_customers_feedback_ex.main:app --host 0.0.0.0 --port 8000
+
+# Run all integration tests
 pytest tests/test_integration.py -v
+
+# Run with coverage
+pytest tests/test_integration.py --cov=disney_customers_feedback_ex
+
+# Run specific test category
+pytest tests/test_integration.py -k "cache" -v
+pytest tests/test_integration.py -k "filter" -v
+
+# Run in parallel
+pytest tests/test_integration.py -n auto
 ```
 
-### Test Individual Components
-
-```bash
-# Test specific functions
-pytest tests/ -k "test_query_endpoint" -v
-```
+See [`tests/README.md`](tests/README.md) for detailed testing documentation.
 
 ## Development
 
@@ -281,38 +712,46 @@ pytest tests/ -k "test_query_endpoint" -v
 ```
 disney_customers_feedback_ex/
 ├── src/disney_customers_feedback_ex/
-│   ├── main.py                 # FastAPI application with telemetry
+│   ├── __init__.py
+│   ├── main.py                    # FastAPI application and endpoints
 │   ├── core/
-│   │   ├── logging.py          # Logging configuration
-│   │   ├── telemetry.py        # OpenTelemetry setup
-│   │   └── metrics.py          # Custom metrics definitions
+│   │   ├── __init__.py
+│   │   ├── lifespan.py           # Application startup/shutdown logic
+│   │   ├── logging.py            # Logging configuration
+│   │   ├── telemetry.py          # OpenTelemetry configuration
+│   │   └── metrics.py            # Custom Prometheus metrics
 │   ├── services/
-│   │   ├── review_service.py   # CSV data loading & search (instrumented)
-│   │   ├── embedding_service.py # Text embedding generation
-│   │   ├── vector_store.py     # ChromaDB integration
-│   │   ├── cache_service.py    # Redis caching with semantic similarity
-│   │   └── llm_service.py      # OpenAI integration
+│   │   ├── __init__.py
+│   │   ├── llm_service.py        # LLM integration (OpenAI)
+│   │   ├── review_service.py     # Review search and filtering
+│   │   ├── embedding_service.py  # Text embedding generation
+│   │   ├── vector_store.py       # ChromaDB vector database
+│   │   └── cache_service.py      # Redis-based semantic caching
 │   └── resources/
-│       └── DisneylandReviews.csv
+│       └── DisneylandReviews.csv # Dataset
 ├── tests/
-│   └── test_integration.py     # API integration tests
+│   ├── __init__.py
+│   ├── test_integration.py        # 40+ integration tests
+│   └── README.md                  # Testing documentation
 ├── grafana/
-│   ├── provisioning/           # Grafana datasources & dashboard config
+│   ├── provisioning/              # Grafana datasources & dashboard config
 │   │   ├── datasources/
 │   │   └── dashboards/
-│   └── dashboards/             # Dashboard JSON files
-├── docker-compose.yml          # All services (Redis, ChromaDB, monitoring stack)
-├── prometheus.yml              # Prometheus configuration
-├── otel-collector-config.yaml # OpenTelemetry Collector config
-├── test_e2e_monitoring.sh     # End-to-end monitoring test
-├── test_monitoring.sh          # Basic monitoring test
-├── test_redis_cache.py         # Redis connectivity test
-├── pyproject.toml             # Dependencies
-├── README.md                  # This file
-├── QUICK_START.md             # Quick reference guide
-├── MONITORING_IMPLEMENTATION.md # Monitoring details
-├── GRAFANA_DASHBOARD_GUIDE.md  # Dashboard usage guide
-└── METRICS_REFERENCE.md        # Metrics documentation
+│   └── dashboards/                # Dashboard JSON files
+├── docker-compose.yml             # All services (Redis, ChromaDB, monitoring stack)
+├── prometheus.yml                 # Prometheus configuration
+├── otel-collector-config.yaml    # OpenTelemetry Collector config
+├── test_e2e_monitoring.sh        # End-to-end monitoring test
+├── test_monitoring.sh             # Basic monitoring test
+├── test_redis_cache.py            # Redis connectivity test
+├── test_cache_integration.sh      # Cache functionality test
+├── pyproject.toml                # Dependencies
+├── README.md                     # This file
+├── QUICK_START.md                # Quick reference guide
+├── REDIS_CACHE_GUIDE.md          # Redis caching documentation
+├── MONITORING_IMPLEMENTATION.md  # Monitoring details
+├── GRAFANA_DASHBOARD_GUIDE.md    # Dashboard usage guide
+└── METRICS_REFERENCE.md           # Metrics documentation
 ```
 
 ### Adding New Features

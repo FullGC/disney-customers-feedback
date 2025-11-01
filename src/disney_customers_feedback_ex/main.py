@@ -2,104 +2,24 @@ from __future__ import annotations
 
 import logging
 import time
-from contextlib import asynccontextmanager
-from pathlib import Path
-import os
 
-from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, Response
 from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
 from pydantic import BaseModel
 
-from disney_customers_feedback_ex.core.logging import setup_logging
-from disney_customers_feedback_ex.core.telemetry import setup_telemetry, get_tracer
+from disney_customers_feedback_ex.core.lifespan import (
+    lifespan,
+    get_review_service,
+    get_llm_service,
+    get_cache_service,
+    get_embedding_service,
+    get_vector_store,
+)
+from disney_customers_feedback_ex.core.telemetry import get_tracer
 from disney_customers_feedback_ex.core import metrics as app_metrics
-from disney_customers_feedback_ex.services.embedding_service import EmbeddingService
-from disney_customers_feedback_ex.services.llm_service import LLMService
-from disney_customers_feedback_ex.services.review_service import ReviewService
-from disney_customers_feedback_ex.services.vector_store import VectorStore
-from disney_customers_feedback_ex.services.cache_service import QueryCacheService
 
 logger = logging.getLogger(__name__)
-
-# Load environment variables
-load_dotenv()
-
-# Global services
-review_service: ReviewService | None = None
-llm_service: LLMService | None = None
-embedding_service: EmbeddingService | None = None
-vector_store: VectorStore | None = None
-cache_service: QueryCacheService | None = None
-
-
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Application lifespan manager."""
-    global review_service, llm_service, embedding_service, vector_store, cache_service
-    
-    # Startup
-    setup_logging()
-    logger.info("Disney Customer Feedback API starting up...")
-    
-    # Setup telemetry
-    setup_telemetry(app, "disney-customer-feedback-api")
-    logger.info("OpenTelemetry instrumentation enabled")
-    
-    # Initialize services
-    data_path = Path(__file__).parent / "resources" / "DisneylandReviews.csv"
-    
-    # Initialize embedding service
-    embedding_service = EmbeddingService()
-    embedding_service.load_model()
-    
-    # Initialize cache service with Redis
-    redis_host = os.getenv("REDIS_HOST", "localhost")
-    redis_port = int(os.getenv("REDIS_PORT", "6379"))
-    cache_service = QueryCacheService(
-        embedding_service=embedding_service,
-        redis_host=redis_host,
-        redis_port=redis_port,
-        redis_db=0,
-        similarity_threshold=0.95,
-        ttl_hours=24
-    )
-    logger.info(f"Cache service initialized with Redis at {redis_host}:{redis_port}")
-    
-    # Initialize vector store
-    vector_store = VectorStore()
-    try:
-        vector_store.connect()
-        
-        # Clean the database before loading new data
-        # logger.info("Cleaning ChromaDB collection before loading new data...")
-        #vector_store.reset_collection()
-        vector_store.create_collection()
-        logger.info("Vector store connected and cleaned successfully")
-    except Exception as e:
-        logger.warning(f"Vector store connection failed: {str(e)}. Continuing without semantic search.")
-        vector_store = None
-        embedding_service = None
-    
-    # Initialize review service with optional vector components
-    review_service = ReviewService(data_path, embedding_service, vector_store)
-    review_service.load_reviews()
-    
-    # Index embeddings if vector store is available
-    if vector_store and embedding_service:
-        try:
-            review_service.index_embeddings()
-        except Exception as e:
-            logger.warning(f"Failed to index embeddings: {str(e)}. Continuing with keyword search only.")
-    
-    # Initialize LLM service
-    llm_service = LLMService()
-    
-    yield
-    
-    # Shutdown
-    logger.info("Disney Customer Feedback API shutting down...")
 
 
 app = FastAPI(
@@ -160,6 +80,7 @@ async def cache_stats() -> JSONResponse:
     Returns:
         JSONResponse with cache statistics.
     """
+    cache_service = get_cache_service()
     if cache_service is None:
         raise HTTPException(status_code=503, detail="Cache service not initialized")
     
@@ -175,6 +96,7 @@ async def clear_cache() -> JSONResponse:
     Returns:
         JSONResponse indicating success.
     """
+    cache_service = get_cache_service()
     if cache_service is None:
         raise HTTPException(status_code=503, detail="Cache service not initialized")
     
@@ -210,8 +132,16 @@ async def query_llm(request: QueryRequest, fastapi_request: Request) -> QueryRes
     start_time = time.time()
     tracer = get_tracer(__name__)
     
-    if review_service is None or llm_service is None:
-        raise HTTPException(status_code=503, detail="Services not initialized")
+    # Get services
+    try:
+        review_service = get_review_service()
+        llm_service = get_llm_service()
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
+    
+    cache_service = get_cache_service()
+    embedding_service = get_embedding_service()
+    vector_store = get_vector_store()
     
     logger.info(f"Query endpoint accessed with question: {request.question}")
     
