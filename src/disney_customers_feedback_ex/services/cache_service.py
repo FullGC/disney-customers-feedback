@@ -176,66 +176,99 @@ class QueryCacheService:
             Dictionary with cached answer and metadata, or None if no match found.
         """
         try:
-            # Generate embedding for the question
+            # Convert user's question into a 384-dimensional embedding vector (e.g., [0.12, 0.45, 0.67, ...])
+            # This allows us to compare semantic similarity, not just exact text matches
             query_embedding_list = self.embedding_service.embed_text(question)
+            
+            # Convert Python list to NumPy array for faster mathematical operations
+            # Use float32 (32-bit) instead of float64 to save memory (half the size)
             query_embedding = np.array(query_embedding_list, dtype=np.float32)
         except Exception as e:
+            # If embedding generation fails (e.g., OpenAI API down), log error and treat as cache miss
             logger.error(f"Failed to generate embedding for cache lookup: {str(e)}")
             return None
         
         try:
-            # Get all cache keys
+            # Retrieve all cached question identifiers from Redis set "disney_cache_keys"
+            # Returns a set like {b'abc123', b'def456', b'ghi789', ...}
             cache_keys = self.redis_client.smembers(self.all_keys_set)
             
+            # If cache is empty (no questions cached yet), return None immediately
             if not cache_keys:
                 logger.debug("Cache is empty")
                 return None
             
-            # Find most similar cached question
+            # Initialize tracking variables for finding the most similar cached question
+            # best_similarity: highest similarity score found so far (0.0 = no match yet)
             best_similarity = 0.0
+            # best_match_key: identifier of the cached question with highest similarity
             best_match_key = None
             
+            # Loop through each cached question to find the most similar one
             for key in cache_keys:
+                # Redis returns bytes (b'abc123'), convert to string ('abc123')
                 key_str = key.decode('utf-8') if isinstance(key, bytes) else key
                 
-                # Get embedding for this cached entry
+                # Generate Redis key for this cached question's embedding (e.g., 'disney_embedding:abc123')
                 embedding_key = self._get_embedding_key(key_str)
+                
+                # Fetch the cached embedding vector from Redis (stored as JSON string)
                 embedding_data = self.redis_client.get(embedding_key)
                 
+                # Skip this cache entry if embedding is missing (expired or corrupted)
                 if not embedding_data:
                     continue
                 
+                # Parse JSON string to Python list, then convert to NumPy array
+                # Example: "[0.15, 0.42, 0.70, ...]" -> [0.15, 0.42, 0.70, ...] -> np.array
                 cached_embedding = np.array(json.loads(embedding_data), dtype=np.float32)
+                
+                # Calculate cosine similarity between user's question and this cached question
+                # Returns a score between 0.0 (completely different) and 1.0 (identical)
                 similarity = self._compute_similarity(query_embedding, cached_embedding)
                 
+                # If this cached question is MORE similar than previous best, update our tracking
                 if similarity > best_similarity:
                     best_similarity = similarity
                     best_match_key = key_str
             
-            # Check if similarity meets threshold
+            # Check if we found a match that's similar enough (≥ 0.95 by default)
+            # Also verify we actually found a match (best_match_key is not None)
             if best_match_key and best_similarity >= self.similarity_threshold:
+                # Generate Redis key for the actual cached answer data (e.g., 'disney_cache:ghi789')
                 cache_key = self._get_cache_key(best_match_key)
+                
+                # Fetch the cached answer data from Redis (contains question, answer, metadata)
                 cached_data = self.redis_client.get(cache_key)
                 
+                # Verify data exists (could have expired between similarity check and retrieval)
                 if cached_data:
+                    # Parse JSON to dictionary containing question, answer, num_reviews_used, timestamp
                     entry_dict = json.loads(cached_data)
+                    
+                    # Log successful cache hit with similarity score and both questions for debugging
                     logger.info(
                         f"Cache HIT - similarity: {best_similarity:.4f}, "
                         f"original: '{entry_dict['question']}', query: '{question}'"
                     )
+                    
+                    # Return cached answer with metadata about the cache hit
                     return {
-                        "question": question,
-                        "answer": entry_dict["answer"],
-                        "num_reviews_used": entry_dict["num_reviews_used"],
-                        "cached": True,
-                        "cache_similarity": best_similarity,
-                        "original_question": entry_dict["question"]
+                        "question": question,  # The user's new question
+                        "answer": entry_dict["answer"],  # The cached answer (reused from similar question)
+                        "num_reviews_used": entry_dict["num_reviews_used"],  # How many reviews were used
+                        "cached": True,  # Flag indicating this is from cache (not freshly generated)
+                        "cache_similarity": best_similarity,  # How similar the match was (e.g., 0.97)
+                        "original_question": entry_dict["question"]  # The original cached question
                     }
             
+            # No sufficiently similar question found - log best similarity and threshold
             logger.debug(f"Cache MISS - best similarity: {best_similarity:.4f}, threshold: {self.similarity_threshold}")
             return None
             
         except RedisError as e:
+            # If Redis fails (connection timeout, server down, etc.), log error and treat as cache miss
+            # This allows the system to continue functioning without cache (degraded but operational)
             logger.error(f"Redis error during cache lookup: {str(e)}")
             return None
     
