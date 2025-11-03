@@ -262,24 +262,94 @@ curl http://localhost:9090/api/v1/targets
 During development, several approaches were considered but ultimately not implemented:
 
 **Cache Similarity Matching**
-- **Considered**: Using LLM to determine if a cached question matches the user's query
-  - Pros: More nuanced understanding of question similarity
-  - Cons: Added latency, API costs, increased complexity
-- **Decision**: Use embedding-based cosine similarity (current implementation)
-  - Rationale: Fast, free after initial embedding generation, highly accurate for semantic similarity (threshold ≥ 0.95)
-  - Trade-off: May miss some paraphrased questions that LLM would catch, but 95% similarity threshold is quite effective
+- **Considered**: Multiple approaches for determining if a cached question matches the user's query
+  - **Approach 1**: LLM-based matching
+    - Use GPT-4o-mini to compare semantic similarity between questions
+    - Pros: Deep understanding of paraphrasing, context, intent
+    - Cons: High latency (~500-1500ms), API costs (~$0.0002 per check), complexity
+  
+  - **Approach 2**: Elasticsearch with fuzzy matching
+    - Index all cached questions in Elasticsearch
+    - Use fuzzy queries with synonyms and n-gram matching
+    - Pros:
+      - Very fast (10-50ms per lookup)
+      - Built-in fuzzy matching handles typos ("Californa" → "California")
+      - Synonym support ("rides" = "attractions" = "roller coasters")
+      - N-gram tokenization catches partial matches
+      - No API costs after setup
+      - Can use BM25 scoring for relevance ranking
+      - Scales well with thousands of cached queries
+    - Cons:
+      - Additional infrastructure (Elasticsearch cluster ~1GB+ memory)
+      - Index maintenance overhead (reindex on cache updates)
+      - Less semantically aware than embeddings (struggles with "What do people say about rides?" ≈ "Tell me visitor opinions on attractions")
+      - Requires tuning (analyzer, tokenizer, fuzziness parameters)
+      - More complex deployment and monitoring
+  
+  - **Approach 3**: Embedding-based cosine similarity (CURRENT IMPLEMENTATION)
+    - Generate embeddings for all questions, compare with cosine similarity
+    - Pros: 
+      - Fast (~10-30ms for 100 cached entries)
+      - Free after initial embedding generation
+      - Highly accurate for semantic similarity (understands "rides" ≈ "attractions")
+      - Simple architecture (just Redis + sentence-transformers)
+      - Threshold ≥ 0.95 provides good precision
+      - No additional infrastructure needed
+    - Cons: 
+      - May miss some paraphrases that LLM would catch
+      - Requires embedding generation for every cache lookup
+      - Performance degrades with 1000+ cached entries (linear search)
 
-**Intent Extraction for Filters**
-- **Considered**: Using embeddings or LLM to extract branch/location when pandas filtering fails
-  - Approach 1: Semantic matching - embed location names and find closest match
-  - Approach 2: LLM extraction - ask the model to identify locations in free text
-  - Pros: Could handle misspellings, abbreviations, or fuzzy matches
-  - Cons: Additional latency, complexity, and potential false positives
-- **Decision**: Rely solely on pandas text filtering with normalization
-  - Rationale: Current approach is fast, handles common variations via normalization (lowercase, remove special chars), and users typically use clear location names
-  - Trade-off: May miss creative phrasings like "the park in France" instead of "Paris", but keeps system simple and predictable
+- **Decision**: Use embedding-based cosine similarity (Approach 3)
+  - Rationale: 
+    - Best balance of **speed** (10-30ms), **cost** ($0), and **accuracy** (~95%+)
+    - Understands semantic similarity better than keyword/fuzzy matching
+    - Simpler infrastructure than Elasticsearch
+    - Faster and cheaper than LLM
+    - Current cache size (<500 entries) doesn't require Elasticsearch's scalability
+  - **When Elasticsearch would make sense**:
+    - Cache grows to 10,000+ entries (embedding comparison becomes slow)
+    - Need to handle typos in cached questions
+    - Multiple language support with synonyms
+    - Complex query variations requiring fuzzy matching
 
-These decisions prioritize **speed, cost-efficiency, and simplicity** while maintaining high accuracy for the majority of use cases.
+**Filter Extraction Method**
+- **Considered**: Multiple approaches for extracting branch/location from questions
+  - **Approach 1**: Semantic matching - embed location names and find closest match
+  - **Approach 2**: LLM extraction - ask the model to identify locations in free text (~500-1500ms, ~$0.0002 per request)
+  - **Approach 3**: Elasticsearch fuzzy matching
+    - Index location names/synonyms in Elasticsearch
+    - Use full-text search with fuzzy matching
+    - Pros:
+      - Handles misspellings ("Cali" → "California", "HK" → "Hong Kong")
+      - Synonym support ("Disneyland Paris" = "Paris park" = "France Disney")
+      - Fuzzy matching for typos ("Californa" → "California")
+      - Very fast (10-50ms)
+      - No API costs
+      - Can match partial phrases ("the park in France" → "Paris")
+    - Cons:
+      - Additional infrastructure dependency (Elasticsearch cluster)
+      - Requires index setup and synonym configuration
+      - More complex deployment
+      - Overkill for only 3 branches and limited locations
+      - Maintenance overhead for synonyms/mappings
+  
+- **Decision**: Use simple keyword matching (current implementation in Step 6)
+  - Rationale: 
+    - Fast (<1ms) and free
+    - Handles common variations effectively for our limited set (3 branches, few locations)
+    - No additional infrastructure needed
+    - Predictable and debuggable
+  - Implementation: Case-insensitive substring matching for "california", "hong kong", "paris", "australia"
+  - Trade-off: May miss creative phrasings like "the park in France" instead of "Paris", or misspellings, but keeps system simple, fast, and cost-effective
+  - **When Elasticsearch would make sense**:
+    - 50+ park locations instead of 3
+    - International queries with various spellings
+    - Complex synonyms ("Magic Kingdom" = "MK" = "Disney World main park")
+    - User-generated abbreviations ("Cali DL", "DLP", "HKDL")
+    - Fuzzy matching requirements for location names
+
+These decisions prioritize **speed, cost-efficiency, and simplicity** while maintaining high accuracy for the majority of use cases. Elasticsearch would be a valuable addition at larger scale, but adds unnecessary complexity for the current dataset size.
 
 ## Query Flow Details
 
@@ -298,11 +368,11 @@ flowchart TD
     
     CacheSearch --> CacheDecision{Step 5: Cache Decision<br/>Similarity ≥ 0.95?}
     CacheDecision -->|YES - Cache HIT| CacheReturn[Return Cached Answer<br/>cached=true<br/>~50-100ms total<br/>$0 cost]
-    CacheDecision -->|NO - Cache MISS| ExtractIntent[Step 6: Extract Query Intent<br/>LLM Service → OpenAI<br/>Extract branch/location<br/>~500-1500ms<br/>~$0.0002]
+    CacheDecision -->|NO - Cache MISS| ExtractFilters[Step 6: Extract Filters<br/>Simple keyword matching<br/>branch/location detection<br/>~1ms<br/>$0]
     
     CacheReturn --> End([Response to User])
     
-    ExtractIntent --> PandasFilter[Step 7: Apply Metadata Filters<br/>ReviewService._apply_filters<br/>Pandas DataFrame ops<br/>~5-20ms]
+    ExtractFilters --> PandasFilter[Step 7: Apply Metadata Filters<br/>ReviewService pandas filtering<br/>DataFrame ops<br/>~5-20ms]
     
     PandasFilter --> KeywordScore[Step 8: Keyword Scoring<br/>Word overlap + phrase boost<br/>~10-100ms]
     
@@ -334,7 +404,9 @@ flowchart TD
     
     FormatResponse --> RecordMetrics[Step 18: Record Metrics & Traces<br/>OpenTelemetry spans<br/>Prometheus metrics<br/>~1-5ms overhead]
     
-    RecordMetrics --> End
+    RecordMetrics --> ClientReturn[Step 19: Return to Client<br/>HTTP 200 + JSON]
+    
+    ClientReturn --> End
     
     style Start fill:#e1f5ff
     style End fill:#e1ffe1
@@ -349,7 +421,7 @@ flowchart TD
     style VectorSearch fill:#d5f5ff
     style VectorID fill:#d5f5ff
     style VectorFull fill:#d5f5ff
-    style ExtractIntent fill:#ffe8f0
+    style ExtractFilters fill:#fff9e6
     style CallLLM fill:#ffe8f0
 ```
 
@@ -437,27 +509,26 @@ User Query → FastAPI → Cache Service → Review Service → LLM Service → 
 
 #### **Phase 3: Review Search (Cache Miss Path)**
 
-**Step 6: Extract Query Intent**
-- **Component**: `llm_service.py` - `extract_query_intent()` method
+**Step 6: Extract Filters from Question**
+- **Component**: `main.py` - Simple keyword matching
+- **Input**: User's question text
 - **Actions**:
-  - Sends question to OpenAI GPT-4o-mini
-  - LLM analyzes question to extract:
-    - `branch` (e.g., "California", "Hong Kong", "Paris")
-    - `location` (reviewer location, e.g., "Australia", "UK")
-  - Returns structured filters as dictionary
+  - Converts question to lowercase
+  - Checks for branch keywords: "california", "hong kong", "paris"
+  - Checks for location keywords: "australia"
+  - Extracts branch and location if found
 - **Features Used**: 
-  - OpenAI API (GPT-4o-mini)
-  - Structured prompt engineering
-  - JSON response parsing
-- **Metrics**: 
-  - `disney_feedback_llm_duration_seconds` histogram
-  - `disney_feedback_llm_calls_total{operation="extract_intent"}` counter
-- **Duration**: ~500-1500ms
-- **Cost**: ~$0.0002 per query
+  - String matching (case-insensitive)
+  - Simple keyword detection
+- **Note**: Uses simple text matching, NOT LLM extraction (see "Design Decisions" section)
+- **Metrics**: `disney_feedback_filter_usage_total{filter_type="branch|location|both"}` counter
+- **Duration**: < 1ms
+- **Cost**: $0
+- **Output**: `branch` (California/Hong_Kong/Paris or None), `location` (Australia or None)
 
 **Step 7: Apply Metadata Filters (Pandas)**
-- **Component**: `review_service.py` - `_apply_filters()` method
-- **Input**: Full DataFrame (42,000+ reviews) + branch/location filters
+- **Component**: `review_service.py` - Pandas DataFrame filtering
+- **Input**: Full DataFrame (42,000+ reviews) + branch/location filters from Step 6
 - **Actions**:
   - Normalizes filter values (lowercase, remove special chars)
   - Filters DataFrame by branch (if specified)
@@ -467,7 +538,7 @@ User Query → FastAPI → Cache Service → Review Service → LLM Service → 
   - Pandas DataFrame operations
   - Case-insensitive text matching
   - Normalized text comparison
-- **Metrics**: `disney_feedback_filter_usage_total{filter_type="branch|location"}` counter
+- **Metrics**: None (filter usage tracked in Step 6)
 - **Duration**: ~5-20ms
 - **Output**: Typically 100-5,000 candidate reviews
 
@@ -563,7 +634,7 @@ User Query → FastAPI → Cache Service → Review Service → LLM Service → 
 #### **Phase 4: LLM Answer Generation**
 
 **Step 14: Build LLM Prompt**
-- **Component**: `llm_service.py` - `answer_question()` method
+- **Component**: `llm_service.py` - `query_with_context()` method
 - **Actions**:
   - Creates system prompt with instructions
   - Formats user prompt with:
@@ -610,6 +681,9 @@ User Query → FastAPI → Cache Service → Review Service → LLM Service → 
 - **Metrics**: `disney_feedback_cache_size` gauge incremented
 - **Duration**: ~5-10ms
 
+---
+
+#### **Phase 5: Response Delivery**
 ---
 
 #### **Phase 5: Response Delivery**
@@ -660,11 +734,13 @@ User Query → FastAPI → Cache Service → Review Service → LLM Service → 
 
 ### Performance Characteristics by Path
 
-| Scenario | Cache | Embeddings | Vector Search | LLM Calls | Total Duration | Cost |
-|----------|-------|------------|---------------|-----------|----------------|------|
-| **Cache Hit** | ✅ Hit | 1 (query) | ❌ Skip | ❌ Skip | ~50-100ms | $0 |
-| **Cache Miss (Hybrid)** | ❌ Miss | 2 (query + cache) | ✅ Yes | 2 (intent + answer) | ~2-5s | ~$0.002 |
-| **Cache Miss (Keyword)** | ❌ Miss | 1 (cache) | ❌ Fallback | 2 (intent + answer) | ~1.5-3s | ~$0.002 |
+| Scenario | Cache | Filter Extract | Embeddings | Vector Search | LLM Calls | Total Duration | Cost |
+|----------|-------|----------------|------------|---------------|-----------|----------------|------|
+| **Cache Hit** | ✅ Hit (Steps 3-5) | ❌ Skip | 1 (cache check) | ❌ Skip | ❌ Skip | ~50-100ms | $0 |
+| **Cache Miss (Hybrid)** | ❌ Miss | ✅ Keywords (Step 6) | 2 (cache + search) | ✅ Yes (Steps 9-12) | 1 (answer only) | ~2-4s | ~$0.001-0.003 |
+| **Cache Miss (Keyword)** | ❌ Miss | ✅ Keywords (Step 6) | 1 (cache) | ❌ Fallback | 1 (answer only) | ~1.5-3s | ~$0.001-0.003 |
+
+**Note**: The system uses simple keyword matching (not LLM) for filter extraction, saving ~$0.0002 and 500-1500ms per request.
 
 ### Services & Components Summary
 
@@ -675,21 +751,21 @@ User Query → FastAPI → Cache Service → Review Service → LLM Service → 
 | **Embedding Service** | Text → vectors | sentence-transformers | Cache check + semantic search |
 | **Vector Store** | Similarity search | ChromaDB | Semantic search (if available) |
 | **Review Service** | Data filtering & search | Pandas | Every cache miss |
-| **LLM Service** | Intent extraction & answer generation | OpenAI GPT-4o-mini | Every cache miss |
+| **LLM Service** | Answer generation | OpenAI GPT-4o-mini | Every cache miss |
 | **Telemetry** | Monitoring & tracing | OpenTelemetry, Prometheus, Jaeger | Every request |
 | **Metrics** | Performance tracking | Prometheus | Continuous |
 
 ### Key Features Along the Flow
 
-1. **Semantic Caching**: Understands similar questions (not just exact matches)
-2. **Hybrid Search**: Combines keyword and semantic approaches for best results
-3. **Dynamic Strategy Selection**: Adapts search strategy based on candidate count
-4. **Metadata Filtering**: Fast pandas-based filtering before expensive vector search
-5. **Score Fusion**: Weighted combination of keyword and semantic relevance
-6. **Cost Optimization**: Cache hits avoid LLM API calls (~$0.002 saved per hit)
-7. **Comprehensive Monitoring**: Every step instrumented with metrics and traces
-8. **Graceful Degradation**: Falls back to keyword search if vector store unavailable
-9. **Batch Processing**: Embeddings indexed in batches during startup
+1. **Semantic Caching**: Understands similar questions (cosine similarity ≥ 0.95)
+2. **Simple Filter Extraction**: Fast keyword matching for branch/location (no LLM needed)
+3. **Hybrid Search**: Combines keyword and semantic approaches for best results
+4. **Dynamic Strategy Selection**: Adapts search strategy based on candidate count
+5. **Metadata Filtering**: Fast pandas-based filtering before expensive vector search
+6. **Score Fusion**: Weighted combination (40% keyword + 60% semantic)
+7. **Cost Optimization**: Cache hits save ~$0.001-0.003 per query
+8. **Comprehensive Monitoring**: All 19 steps instrumented with metrics and traces
+9. **Graceful Degradation**: Falls back to keyword search if vector store unavailable
 10. **TTL Management**: Automatic cache expiration after 24 hours
 
 ## Testing
